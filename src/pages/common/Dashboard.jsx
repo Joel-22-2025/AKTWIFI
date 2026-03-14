@@ -4,7 +4,7 @@ import { collection, getDocs, orderBy, query } from "firebase/firestore";
 import { auth, db } from "../../service/firebase";
 import { useNavigate } from "react-router-dom";
 
-// ── Icônes SVG inline (pas de dépendance externe) ──────────────
+// ── Icônes SVG inline ──────────────────────────────────────────
 const Icon = {
   wifi:    () => <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.14 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"/></svg>,
   users:   () => <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>,
@@ -19,17 +19,62 @@ const Icon = {
   mac:     () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>,
   phone:   () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.948V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>,
   chevron: () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>,
+  clock:   () => <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>,
 };
 
 const PAGE_SIZE = 10;
 
+// ── Convertir un timestamp Firestore ou une valeur quelconque en Date ──
+// Gère : Firestore Timestamp, string ISO, number (ms), null/undefined
+const toDate = ts => {
+  if (!ts) return null;
+  if (ts?.toDate) return ts.toDate();           // Firestore Timestamp
+  if (ts instanceof Date) return ts;             // déjà une Date
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? null : d;          // string ou number
+};
+
+// ── Formater une date en français ──
+const fmtDate = ts => {
+  const d = toDate(ts);
+  if (!d) return "—";
+  return (
+    d.toLocaleDateString("fr-FR", {
+      weekday: "short", day: "numeric", month: "short", year: "numeric",
+    }) +
+    " à " +
+    d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })
+  );
+};
+
+// ── Badge statut ──
+const BadgeStatut = ({ statut }) => {
+  const s = (statut || "").toLowerCase();
+  if (s === "connecté" || s === "connecte") {
+    return (
+      <span className="inline-flex items-center gap-1 bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold rounded-full px-2.5 py-0.5">
+        <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" />
+        Connecté
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 bg-amber-50 text-amber-700 border border-amber-200 text-xs font-semibold rounded-full px-2.5 py-0.5">
+      <span className="w-1.5 h-1.5 bg-amber-400 rounded-full animate-pulse" />
+      En attente
+    </span>
+  );
+};
+
 const Dashboard = () => {
-  const [rows, setRows]           = useState([]);
-  const [filtered, setFiltered]   = useState([]);
-  const [search, setSearch]       = useState("");
-  const [dateFilter, setDateFilter] = useState("all");
-  const [loading, setLoading]     = useState(true);
-  const [page, setPage]           = useState(1);
+  const [rows, setRows]               = useState([]);
+  const [filtered, setFiltered]       = useState([]);
+  const [search, setSearch]           = useState("");
+  const [dateFilter, setDateFilter]   = useState("all");
+  // NOUVEAU : filtre par statut
+  const [statutFilter, setStatutFilter] = useState("all");
+  const [loading, setLoading]         = useState(true);
+  const [page, setPage]               = useState(1);
   const [lastRefresh, setLastRefresh] = useState(null);
   const [logoutConfirm, setLogoutConfirm] = useState(false);
   const navigate = useNavigate();
@@ -40,13 +85,14 @@ const Dashboard = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const q    = query(collection(db, "identites_arcep"), orderBy("date_connexion", "desc"));
+      // On trie par date_enregistrement en fallback si date_connexion est absent
+      const q    = query(collection(db, "identites_arcep"), orderBy("date_enregistrement", "desc"));
       const snap = await getDocs(q);
       const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       setRows(data);
       setLastRefresh(new Date());
     } catch (e) {
-      console.error(e);
+      console.error("Erreur chargement Firebase :", e);
     } finally {
       setLoading(false);
     }
@@ -61,38 +107,53 @@ const Dashboard = () => {
     const week  = new Date(today); week.setDate(week.getDate() - 7);
     const month = new Date(today); month.setDate(1);
 
-    const toDate = ts => ts?.toDate ? ts.toDate() : new Date(ts);
-
-    let result = rows.filter(r => {
+    const result = rows.filter(r => {
+      // Filtre recherche
       const q = search.toLowerCase();
       const matchSearch = !q || [r.nom, r.prenom, r.telephone, r.ticket_code, r.adresse_mac, r.adresse_ip]
         .some(v => v && v.toLowerCase().includes(q));
 
-      const d = toDate(r.date_connexion);
+      // Filtre date — utilise date_connexion si dispo, sinon date_enregistrement
+      const d = toDate(r.date_connexion) || toDate(r.date_enregistrement);
       const matchDate =
         dateFilter === "all"   ? true :
-        dateFilter === "today" ? d >= today :
-        dateFilter === "week"  ? d >= week  :
-        dateFilter === "month" ? d >= month : true;
+        dateFilter === "today" ? (d && d >= today) :
+        dateFilter === "week"  ? (d && d >= week)  :
+        dateFilter === "month" ? (d && d >= month) : true;
 
-      return matchSearch && matchDate;
+      // Filtre statut — NOUVEAU
+      const statut = (r.statut || "").toLowerCase();
+      const matchStatut =
+        statutFilter === "all"        ? true :
+        statutFilter === "connecte"   ? (statut === "connecté" || statut === "connecte") :
+        statutFilter === "en_attente" ? (statut === "en_attente" || statut === "") : true;
+
+      return matchSearch && matchDate && matchStatut;
     });
 
     setFiltered(result);
     setPage(1);
-  }, [search, dateFilter, rows]);
+  }, [search, dateFilter, statutFilter, rows]);
 
   // ── Stats ─────────────────────────────────────────────────────
-  const toDate = ts => ts?.toDate ? ts.toDate() : new Date(ts);
-  const now    = new Date();
-  const today  = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const week   = new Date(today); week.setDate(week.getDate() - 7);
+  const now   = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const week  = new Date(today); week.setDate(week.getDate() - 7);
 
   const stats = {
-    total:   rows.length,
-    today:   rows.filter(r => toDate(r.date_connexion) >= today).length,
-    week:    rows.filter(r => toDate(r.date_connexion) >= week).length,
-    unique:  new Set(rows.map(r => r.telephone).filter(Boolean)).size,
+    total:      rows.length,
+    connectes:  rows.filter(r => {
+                  const s = (r.statut || "").toLowerCase();
+                  return s === "connecté" || s === "connecte";
+                }).length,
+    enAttente:  rows.filter(r => {
+                  const s = (r.statut || "").toLowerCase();
+                  return s === "en_attente" || s === "";
+                }).length,
+    today:      rows.filter(r => {
+                  const d = toDate(r.date_connexion) || toDate(r.date_enregistrement);
+                  return d && d >= today;
+                }).length,
   };
 
   // ── Pagination ────────────────────────────────────────────────
@@ -101,21 +162,28 @@ const Dashboard = () => {
 
   // ── Export CSV ────────────────────────────────────────────────
   const exportCSV = () => {
-    const headers = ["Nom", "Prénom", "Téléphone", "Ticket", "MAC", "IP", "Date"];
+    const headers = ["Nom", "Prénom", "Téléphone", "Ticket", "Statut", "MAC", "IP", "Date inscription", "Date connexion"];
     const lines   = filtered.map(r => {
-      const d = toDate(r.date_connexion);
-      return [r.nom, r.prenom, r.telephone, r.ticket_code, r.adresse_mac, r.adresse_ip,
-        isNaN(d) ? "" : d.toLocaleString("fr-FR")
+      const dEnreg  = toDate(r.date_enregistrement);
+      const dConnex = toDate(r.date_connexion);
+      return [
+        r.nom, r.prenom, r.telephone, r.ticket_code, r.statut,
+        r.adresse_mac, r.adresse_ip,
+        dEnreg  && !isNaN(dEnreg)  ? dEnreg.toLocaleString("fr-FR")  : "",
+        dConnex && !isNaN(dConnex) ? dConnex.toLocaleString("fr-FR") : "",
       ].map(v => `"${(v || "").replace(/"/g, '""')}"`).join(",");
     });
-    const blob = new Blob(["\ufeff" + [headers.join(","), ...lines].join("\n")], { type: "text/csv;charset=utf-8;" });
+    const blob = new Blob(
+      ["\ufeff" + [headers.join(","), ...lines].join("\n")],
+      { type: "text/csv;charset=utf-8;" }
+    );
     const a    = document.createElement("a");
     a.href     = URL.createObjectURL(blob);
     a.download = `aktwifi_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
   };
 
-  // ── Export PDF (print) ────────────────────────────────────────
+  // ── Export PDF ────────────────────────────────────────────────
   const exportPDF = () => window.print();
 
   // ── Déconnexion ───────────────────────────────────────────────
@@ -124,18 +192,10 @@ const Dashboard = () => {
     navigate("/login");
   };
 
-  // ── Formater date ─────────────────────────────────────────────
-  const fmtDate = ts => {
-    const d = toDate(ts);
-    if (isNaN(d)) return "—";
-    return d.toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short", year: "numeric" })
-      + " à " + d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
-  };
-
   return (
     <div className="min-h-screen bg-slate-50 font-sans">
 
-      {/* ── CONFIRM LOGOUT MODAL ─────────────────────────────── */}
+      {/* ── MODAL DÉCONNEXION ─────────────────────────────────── */}
       {logoutConfirm && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center px-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
@@ -161,7 +221,6 @@ const Dashboard = () => {
       {/* ── HEADER ───────────────────────────────────────────── */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-          {/* Logo */}
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-9 h-9 bg-gradient-to-br from-blue-600 to-cyan-400 rounded-xl flex items-center justify-center shadow-md flex-shrink-0">
               <Icon.wifi />
@@ -172,15 +231,12 @@ const Dashboard = () => {
             </div>
           </div>
 
-          {/* Badge abonnement */}
           <div className="hidden md:flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-full px-3 py-1.5">
             <span className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
             <span className="text-emerald-700 text-xs font-semibold uppercase tracking-wide">Abonnement Actif</span>
           </div>
 
-          {/* Right */}
           <div className="flex items-center gap-2 sm:gap-3">
-            {/* User email */}
             <span className="text-xs text-gray-500 hidden lg:block truncate max-w-[160px]">
               {user?.email}
             </span>
@@ -198,10 +254,10 @@ const Dashboard = () => {
         {/* ── STAT CARDS ───────────────────────────────────────── */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
           {[
-            { label: "Total connexions", value: stats.total,  icon: <Icon.users />,  color: "blue",    bg: "bg-blue-50",    text: "text-blue-600",    border: "border-blue-100" },
-            { label: "Aujourd'hui",       value: stats.today,  icon: <Icon.today />,  color: "emerald", bg: "bg-emerald-50", text: "text-emerald-600", border: "border-emerald-100" },
-            { label: "Cette semaine",     value: stats.week,   icon: <Icon.wifi />,   color: "violet",  bg: "bg-violet-50",  text: "text-violet-600",  border: "border-violet-100" },
-            { label: "Utilisateurs uniq.", value: stats.unique, icon: <Icon.ticket />, color: "amber",   bg: "bg-amber-50",   text: "text-amber-600",   border: "border-amber-100" },
+            { label: "Total inscrits",    value: stats.total,     icon: <Icon.users />,  bg: "bg-blue-50",    text: "text-blue-600",    border: "border-blue-100" },
+            { label: "Connectés",         value: stats.connectes, icon: <Icon.wifi />,   bg: "bg-emerald-50", text: "text-emerald-600", border: "border-emerald-100" },
+            { label: "En attente",        value: stats.enAttente, icon: <Icon.ticket />, bg: "bg-amber-50",   text: "text-amber-600",   border: "border-amber-100" },
+            { label: "Aujourd'hui",       value: stats.today,     icon: <Icon.today />,  bg: "bg-violet-50",  text: "text-violet-600",  border: "border-violet-100" },
           ].map((s, i) => (
             <div key={i} className={`bg-white rounded-2xl border ${s.border} p-4 sm:p-5 shadow-sm`}>
               <div className={`w-9 h-9 ${s.bg} ${s.text} rounded-xl flex items-center justify-center mb-3`}>
@@ -222,7 +278,6 @@ const Dashboard = () => {
           <div className="p-4 sm:p-5 border-b border-slate-100 space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center gap-3">
 
-              {/* Titre + refresh */}
               <div className="flex items-center gap-2 flex-1 min-w-0">
                 <h2 className="font-bold text-gray-800 text-base truncate">Historique des connexions</h2>
                 {lastRefresh && (
@@ -232,7 +287,6 @@ const Dashboard = () => {
                 )}
               </div>
 
-              {/* Actions */}
               <div className="flex items-center gap-2 flex-wrap">
                 <button onClick={loadData}
                   className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl px-3 py-2 text-xs font-medium transition">
@@ -251,11 +305,10 @@ const Dashboard = () => {
 
             {/* Filtres */}
             <div className="flex flex-col sm:flex-row gap-2">
-              {/* Search */}
+
+              {/* Recherche */}
               <div className="relative flex-1">
-                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">
-                  <Icon.search />
-                </span>
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"><Icon.search /></span>
                 <input
                   type="text"
                   placeholder="Rechercher nom, téléphone, ticket, MAC..."
@@ -264,11 +317,10 @@ const Dashboard = () => {
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-4 py-2.5 text-sm text-gray-700 placeholder-gray-400 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition"
                 />
               </div>
-              {/* Date filter */}
+
+              {/* Filtre date */}
               <div className="relative">
-                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">
-                  <Icon.filter />
-                </span>
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"><Icon.filter /></span>
                 <select
                   value={dateFilter}
                   onChange={e => setDateFilter(e.target.value)}
@@ -279,19 +331,31 @@ const Dashboard = () => {
                   <option value="week">Cette semaine</option>
                   <option value="month">Ce mois</option>
                 </select>
-                <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none">
-                  <Icon.chevron />
-                </span>
+                <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none"><Icon.chevron /></span>
+              </div>
+
+              {/* Filtre statut — NOUVEAU */}
+              <div className="relative">
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"><Icon.filter /></span>
+                <select
+                  value={statutFilter}
+                  onChange={e => setStatutFilter(e.target.value)}
+                  className="appearance-none bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-8 py-2.5 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition cursor-pointer"
+                >
+                  <option value="all">Tous les statuts</option>
+                  <option value="connecte">Connectés</option>
+                  <option value="en_attente">En attente</option>
+                </select>
+                <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none"><Icon.chevron /></span>
               </div>
             </div>
 
-            {/* Résultats count */}
             <p className="text-xs text-gray-400">
               {filtered.length} résultat{filtered.length > 1 ? "s" : ""} trouvé{filtered.length > 1 ? "s" : ""}
             </p>
           </div>
 
-          {/* ── TABLE desktop ── */}
+          {/* ── Contenu ── */}
           {loading ? (
             <div className="flex flex-col items-center justify-center py-16 gap-3">
               <svg className="animate-spin w-8 h-8 text-blue-500" viewBox="0 0 24 24" fill="none">
@@ -308,7 +372,7 @@ const Dashboard = () => {
             </div>
           ) : (
             <>
-              {/* Table — visible md+ */}
+              {/* ── TABLE desktop md+ ── */}
               <div className="hidden md:block overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -316,96 +380,140 @@ const Dashboard = () => {
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">#</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Nom & Prénom</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Contact</th>
-                      <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Date & Heure</th>
+                      <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Statut</th>
+                      <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Date connexion</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Ticket</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Adresse MAC</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">IP</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-50">
-                    {paginated.map((r, i) => (
-                      <tr key={r.id} className="hover:bg-blue-50/40 transition group">
-                        <td className="px-5 py-4 text-slate-400 text-xs font-mono">
-                          {(page - 1) * PAGE_SIZE + i + 1}
-                        </td>
-                        <td className="px-5 py-4">
-                          <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
-                              {(r.nom?.[0] || "?").toUpperCase()}
+                    {paginated.map((r, i) => {
+                      const estConnecte = ["connecté", "connecte"].includes((r.statut || "").toLowerCase());
+                      return (
+                        <tr key={r.id} className="hover:bg-blue-50/40 transition">
+                          <td className="px-5 py-4 text-slate-400 text-xs font-mono">
+                            {(page - 1) * PAGE_SIZE + i + 1}
+                          </td>
+                          <td className="px-5 py-4">
+                            <div className="flex items-center gap-3">
+                              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+                                {/* Initiale visible seulement si connecté */}
+                                {estConnecte ? (r.nom?.[0] || "?").toUpperCase() : "?"}
+                              </div>
+                              <div>
+                                {estConnecte ? (
+                                  <p className="font-semibold text-gray-800">{r.nom} {r.prenom}</p>
+                                ) : (
+                                  <p className="text-gray-400 text-xs italic">Non validé</p>
+                                )}
+                              </div>
                             </div>
-                            <div>
-                              <p className="font-semibold text-gray-800">{r.nom} {r.prenom}</p>
+                          </td>
+                          <td className="px-5 py-4">
+                            {estConnecte && r.telephone ? (
+                              <a href={`tel:${r.telephone}`} className="text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1.5 transition">
+                                <Icon.phone />
+                                {r.telephone}
+                              </a>
+                            ) : (
+                              <span className="text-gray-300 text-xs">—</span>
+                            )}
+                          </td>
+                          <td className="px-5 py-4">
+                            <BadgeStatut statut={r.statut} />
+                          </td>
+                          <td className="px-5 py-4 text-gray-600 text-xs leading-relaxed">
+                            {/* Priorité : date_connexion, sinon date_enregistrement */}
+                            <div className="flex items-center gap-1.5">
+                              <Icon.clock />
+                              <span>
+                                {toDate(r.date_connexion)
+                                  ? fmtDate(r.date_connexion)
+                                  : toDate(r.date_enregistrement)
+                                  ? fmtDate(r.date_enregistrement)
+                                  : "—"}
+                              </span>
                             </div>
-                          </div>
-                        </td>
-                        <td className="px-5 py-4">
-                          <a href={`tel:${r.telephone}`} className="text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1.5 transition">
-                            <Icon.phone />
-                            {r.telephone || "—"}
-                          </a>
-                        </td>
-                        <td className="px-5 py-4 text-gray-600 text-xs leading-relaxed">
-                          {fmtDate(r.date_connexion)}
-                        </td>
-                        <td className="px-5 py-4">
-                          <span className="inline-flex items-center bg-slate-100 text-slate-700 text-xs font-mono font-semibold rounded-lg px-2.5 py-1">
-                            {r.ticket_code || "—"}
-                          </span>
-                        </td>
-                        <td className="px-5 py-4">
-                          <span className="flex items-center gap-1.5 text-gray-500 text-xs font-mono">
-                            <Icon.mac />
-                            {r.adresse_mac || "—"}
-                          </span>
-                        </td>
-                        <td className="px-5 py-4 text-gray-500 text-xs font-mono">
-                          {r.adresse_ip || "—"}
-                        </td>
-                      </tr>
-                    ))}
+                          </td>
+                          <td className="px-5 py-4">
+                            <span className="inline-flex items-center bg-slate-100 text-slate-700 text-xs font-mono font-semibold rounded-lg px-2.5 py-1">
+                              {r.ticket_code || "—"}
+                            </span>
+                          </td>
+                          <td className="px-5 py-4">
+                            <span className="flex items-center gap-1.5 text-gray-500 text-xs font-mono">
+                              <Icon.mac />
+                              {r.adresse_mac || "—"}
+                            </span>
+                          </td>
+                          <td className="px-5 py-4 text-gray-500 text-xs font-mono">
+                            {r.adresse_ip || "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
 
-              {/* Cards — mobile uniquement */}
+              {/* ── CARDS mobile ── */}
               <div className="md:hidden divide-y divide-slate-100">
-                {paginated.map((r, i) => (
-                  <div key={r.id} className="p-4 space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
-                          {(r.nom?.[0] || "?").toUpperCase()}
+                {paginated.map((r) => {
+                  const estConnecte = ["connecté", "connecte"].includes((r.statut || "").toLowerCase());
+                  return (
+                    <div key={r.id} className="p-4 space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
+                            {estConnecte ? (r.nom?.[0] || "?").toUpperCase() : "?"}
+                          </div>
+                          <div>
+                            {estConnecte ? (
+                              <>
+                                <p className="font-bold text-gray-800 text-sm">{r.nom} {r.prenom}</p>
+                                <a href={`tel:${r.telephone}`} className="text-blue-600 text-xs font-medium">
+                                  {r.telephone || "—"}
+                                </a>
+                              </>
+                            ) : (
+                              <p className="text-gray-400 text-xs italic">Non validé</p>
+                            )}
+                          </div>
                         </div>
-                        <div>
-                          <p className="font-bold text-gray-800 text-sm">{r.nom} {r.prenom}</p>
-                          <a href={`tel:${r.telephone}`} className="text-blue-600 text-xs font-medium">
-                            {r.telephone || "—"}
-                          </a>
+                        <div className="flex flex-col items-end gap-1.5">
+                          <BadgeStatut statut={r.statut} />
+                          <span className="inline-flex bg-slate-100 text-slate-700 text-xs font-mono font-semibold rounded-lg px-2.5 py-1">
+                            {r.ticket_code || "—"}
+                          </span>
                         </div>
                       </div>
-                      <span className="inline-flex bg-slate-100 text-slate-700 text-xs font-mono font-semibold rounded-lg px-2.5 py-1 flex-shrink-0">
-                        {r.ticket_code || "—"}
-                      </span>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div className="bg-slate-50 rounded-xl p-2.5">
+                          <p className="text-gray-400 mb-0.5">Date connexion</p>
+                          <p className="text-gray-700 font-medium leading-snug">
+                            {toDate(r.date_connexion)
+                              ? fmtDate(r.date_connexion)
+                              : toDate(r.date_enregistrement)
+                              ? fmtDate(r.date_enregistrement)
+                              : "—"}
+                          </p>
+                        </div>
+                        <div className="bg-slate-50 rounded-xl p-2.5">
+                          <p className="text-gray-400 mb-0.5">Adresse IP</p>
+                          <p className="text-gray-700 font-mono font-medium">{r.adresse_ip || "—"}</p>
+                        </div>
+                        <div className="bg-slate-50 rounded-xl col-span-2 p-2.5">
+                          <p className="text-gray-400 mb-0.5">Adresse MAC</p>
+                          <p className="text-gray-700 font-mono font-medium">{r.adresse_mac || "—"}</p>
+                        </div>
+                      </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div className="bg-slate-50 rounded-xl p-2.5">
-                        <p className="text-gray-400 mb-0.5">Date & Heure</p>
-                        <p className="text-gray-700 font-medium leading-snug">{fmtDate(r.date_connexion)}</p>
-                      </div>
-                      <div className="bg-slate-50 rounded-xl p-2.5">
-                        <p className="text-gray-400 mb-0.5">Adresse IP</p>
-                        <p className="text-gray-700 font-mono font-medium">{r.adresse_ip || "—"}</p>
-                      </div>
-                      <div className="bg-slate-50 rounded-xl col-span-2 p-2.5">
-                        <p className="text-gray-400 mb-0.5">Adresse MAC</p>
-                        <p className="text-gray-700 font-mono font-medium">{r.adresse_mac || "—"}</p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
 
-              {/* Pagination */}
+              {/* ── Pagination ── */}
               {totalPages > 1 && (
                 <div className="flex items-center justify-between px-5 py-4 border-t border-slate-100 gap-2 flex-wrap">
                   <p className="text-xs text-gray-400">
