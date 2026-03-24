@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { signOut } from "firebase/auth";
-import { collection, getDocs, orderBy, query } from "firebase/firestore";
+import { collection, getDocs, query } from "firebase/firestore";
 import { auth, db } from "../../service/firebase";
 import { useNavigate } from "react-router-dom";
 
@@ -25,14 +25,17 @@ const Icon = {
 const PAGE_SIZE = 10;
 
 // ── Convertir un timestamp Firestore ou une valeur quelconque en Date ──
-// Gère : Firestore Timestamp, string ISO, number (ms), null/undefined
 const toDate = ts => {
   if (!ts) return null;
-  if (ts?.toDate) return ts.toDate();           // Firestore Timestamp
-  if (ts instanceof Date) return ts;             // déjà une Date
+  if (ts?.toDate) return ts.toDate();
+  if (ts instanceof Date) return ts;
   const d = new Date(ts);
-  return isNaN(d.getTime()) ? null : d;          // string ou number
+  return isNaN(d.getTime()) ? null : d;
 };
+
+// ── Obtenir la date de référence d'un document ──────────────────
+// Priorité : date_connexion (nouveau code) → date_enregistrement (ancien code)
+const getDateRef = r => toDate(r.date_connexion) || toDate(r.date_enregistrement) || null;
 
 // ── Formater une date en français ──
 const fmtDate = ts => {
@@ -67,38 +70,58 @@ const BadgeStatut = ({ statut }) => {
 };
 
 const Dashboard = () => {
-  const [rows, setRows]               = useState([]);
-  const [filtered, setFiltered]       = useState([]);
-  const [search, setSearch]           = useState("");
-  const [dateFilter, setDateFilter]   = useState("all");
-  // NOUVEAU : filtre par statut
-  const [statutFilter, setStatutFilter] = useState("all");
-  const [loading, setLoading]         = useState(true);
-  const [page, setPage]               = useState(1);
-  const [lastRefresh, setLastRefresh] = useState(null);
+  const [rows, setRows]                   = useState([]);
+  const [filtered, setFiltered]           = useState([]);
+  const [search, setSearch]               = useState("");
+  const [dateFilter, setDateFilter]       = useState("all");
+  const [statutFilter, setStatutFilter]   = useState("all");
+  const [loading, setLoading]             = useState(true);
+  const [error, setError]                 = useState(null);
+  const [page, setPage]                   = useState(1);
+  const [lastRefresh, setLastRefresh]     = useState(null);
   const [logoutConfirm, setLogoutConfirm] = useState(false);
   const navigate = useNavigate();
 
   const user = auth.currentUser;
 
   // ── Chargement Firestore ──────────────────────────────────────
-  const loadData = async () => {
+  // CORRIGÉ : plus de orderBy côté Firestore.
+  // orderBy("date_enregistrement") plantait si le champ était absent
+  // sur certains documents (nouveau code n'écrit plus ce champ),
+  // ce qui levait une erreur Firestore et déclenchait une redirection
+  // vers /login dans le catch du routeur protégé.
+  // Le tri est désormais fait côté client, après chargement.
+  const loadData = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
-      // On trie par date_enregistrement en fallback si date_connexion est absent
-      const q    = query(collection(db, "identites_arcep"), orderBy("date_enregistrement", "desc"));
-      const snap = await getDocs(q);
+      const snap = await getDocs(query(collection(db, "identites_arcep")));
       const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+      // Tri côté client — du plus récent au plus ancien
+      // Utilise date_connexion en priorité, sinon date_enregistrement
+      data.sort((a, b) => {
+        const da = getDateRef(a);
+        const db_ = getDateRef(b);
+        if (!da && !db_) return 0;
+        if (!da) return 1;
+        if (!db_) return -1;
+        return db_ - da;
+      });
+
       setRows(data);
       setLastRefresh(new Date());
     } catch (e) {
-      console.error("Erreur chargement Firebase :", e);
+      // CORRIGÉ : on stocke l'erreur dans le state local et on
+      // l'affiche dans l'UI. On ne laisse plus le routeur protégé
+      // intercepter et rediriger vers /login.
+      setError("Impossible de charger les données. Vérifiez votre connexion.");
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => { loadData(); }, []);
+  useEffect(() => { loadData(); }, [loadData]);
 
   // ── Filtres ───────────────────────────────────────────────────
   useEffect(() => {
@@ -113,15 +136,15 @@ const Dashboard = () => {
       const matchSearch = !q || [r.nom, r.prenom, r.telephone, r.ticket_code, r.adresse_mac, r.adresse_ip]
         .some(v => v && v.toLowerCase().includes(q));
 
-      // Filtre date — utilise date_connexion si dispo, sinon date_enregistrement
-      const d = toDate(r.date_connexion) || toDate(r.date_enregistrement);
+      // Filtre date — date_connexion prioritaire, sinon date_enregistrement
+      const d = getDateRef(r);
       const matchDate =
         dateFilter === "all"   ? true :
         dateFilter === "today" ? (d && d >= today) :
         dateFilter === "week"  ? (d && d >= week)  :
         dateFilter === "month" ? (d && d >= month) : true;
 
-      // Filtre statut — NOUVEAU
+      // Filtre statut
       const statut = (r.statut || "").toLowerCase();
       const matchStatut =
         statutFilter === "all"        ? true :
@@ -138,22 +161,21 @@ const Dashboard = () => {
   // ── Stats ─────────────────────────────────────────────────────
   const now   = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const week  = new Date(today); week.setDate(week.getDate() - 7);
 
   const stats = {
-    total:      rows.length,
-    connectes:  rows.filter(r => {
-                  const s = (r.statut || "").toLowerCase();
-                  return s === "connecté" || s === "connecte";
-                }).length,
-    enAttente:  rows.filter(r => {
-                  const s = (r.statut || "").toLowerCase();
-                  return s === "en_attente" || s === "";
-                }).length,
-    today:      rows.filter(r => {
-                  const d = toDate(r.date_connexion) || toDate(r.date_enregistrement);
-                  return d && d >= today;
-                }).length,
+    total:     rows.length,
+    connectes: rows.filter(r => {
+      const s = (r.statut || "").toLowerCase();
+      return s === "connecté" || s === "connecte";
+    }).length,
+    enAttente: rows.filter(r => {
+      const s = (r.statut || "").toLowerCase();
+      return s === "en_attente" || s === "";
+    }).length,
+    today: rows.filter(r => {
+      const d = getDateRef(r);
+      return d && d >= today;
+    }).length,
   };
 
   // ── Pagination ────────────────────────────────────────────────
@@ -162,15 +184,14 @@ const Dashboard = () => {
 
   // ── Export CSV ────────────────────────────────────────────────
   const exportCSV = () => {
-    const headers = ["Nom", "Prénom", "Téléphone", "Ticket", "Statut", "MAC", "IP", "Date inscription", "Date connexion"];
+    const headers = ["Nom", "Prénom", "Téléphone", "Ticket", "Statut", "Source", "MAC", "IP", "Date connexion"];
     const lines   = filtered.map(r => {
-      const dEnreg  = toDate(r.date_enregistrement);
-      const dConnex = toDate(r.date_connexion);
+      const d = getDateRef(r);
       return [
-        r.nom, r.prenom, r.telephone, r.ticket_code, r.statut,
+        r.nom, r.prenom, r.telephone, r.ticket_code,
+        r.statut, r.source,
         r.adresse_mac, r.adresse_ip,
-        dEnreg  && !isNaN(dEnreg)  ? dEnreg.toLocaleString("fr-FR")  : "",
-        dConnex && !isNaN(dConnex) ? dConnex.toLocaleString("fr-FR") : "",
+        d && !isNaN(d) ? d.toLocaleString("fr-FR") : "",
       ].map(v => `"${(v || "").replace(/"/g, '""')}"`).join(",");
     });
     const blob = new Blob(
@@ -251,13 +272,24 @@ const Dashboard = () => {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
+        {/* ── BANNIÈRE ERREUR ───────────────────────────────────── */}
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-2xl px-4 py-3 flex items-center justify-between gap-3">
+            <p className="text-red-700 text-sm font-medium">{error}</p>
+            <button onClick={loadData}
+              className="flex items-center gap-1.5 bg-red-500 hover:bg-red-600 text-white rounded-xl px-3 py-1.5 text-xs font-semibold transition flex-shrink-0">
+              <Icon.refresh /> Réessayer
+            </button>
+          </div>
+        )}
+
         {/* ── STAT CARDS ───────────────────────────────────────── */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
           {[
-            { label: "Total inscrits",    value: stats.total,     icon: <Icon.users />,  bg: "bg-blue-50",    text: "text-blue-600",    border: "border-blue-100" },
-            { label: "Connectés",         value: stats.connectes, icon: <Icon.wifi />,   bg: "bg-emerald-50", text: "text-emerald-600", border: "border-emerald-100" },
-            { label: "En attente",        value: stats.enAttente, icon: <Icon.ticket />, bg: "bg-amber-50",   text: "text-amber-600",   border: "border-amber-100" },
-            { label: "Aujourd'hui",       value: stats.today,     icon: <Icon.today />,  bg: "bg-violet-50",  text: "text-violet-600",  border: "border-violet-100" },
+            { label: "Total inscrits", value: stats.total,     icon: <Icon.users />, bg: "bg-blue-50",    text: "text-blue-600",    border: "border-blue-100"    },
+            { label: "Connectés",      value: stats.connectes, icon: <Icon.wifi />,  bg: "bg-emerald-50", text: "text-emerald-600", border: "border-emerald-100" },
+            { label: "En attente",     value: stats.enAttente, icon: <Icon.ticket />,bg: "bg-amber-50",   text: "text-amber-600",   border: "border-amber-100"   },
+            { label: "Aujourd'hui",    value: stats.today,     icon: <Icon.today />, bg: "bg-violet-50",  text: "text-violet-600",  border: "border-violet-100"  },
           ].map((s, i) => (
             <div key={i} className={`bg-white rounded-2xl border ${s.border} p-4 sm:p-5 shadow-sm`}>
               <div className={`w-9 h-9 ${s.bg} ${s.text} rounded-xl flex items-center justify-center mb-3`}>
@@ -277,7 +309,6 @@ const Dashboard = () => {
           {/* Toolbar */}
           <div className="p-4 sm:p-5 border-b border-slate-100 space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-
               <div className="flex items-center gap-2 flex-1 min-w-0">
                 <h2 className="font-bold text-gray-800 text-base truncate">Historique des connexions</h2>
                 {lastRefresh && (
@@ -288,9 +319,10 @@ const Dashboard = () => {
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
-                <button onClick={loadData}
-                  className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl px-3 py-2 text-xs font-medium transition">
-                  <Icon.refresh /><span className="hidden sm:inline">Actualiser</span>
+                <button onClick={loadData} disabled={loading}
+                  className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl px-3 py-2 text-xs font-medium transition disabled:opacity-50 disabled:cursor-not-allowed">
+                  <span className={loading ? "animate-spin" : ""}><Icon.refresh /></span>
+                  <span className="hidden sm:inline">Actualiser</span>
                 </button>
                 <button onClick={exportCSV}
                   className="flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl px-3 py-2 text-xs font-semibold transition">
@@ -305,7 +337,6 @@ const Dashboard = () => {
 
             {/* Filtres */}
             <div className="flex flex-col sm:flex-row gap-2">
-
               {/* Recherche */}
               <div className="relative flex-1">
                 <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"><Icon.search /></span>
@@ -321,11 +352,8 @@ const Dashboard = () => {
               {/* Filtre date */}
               <div className="relative">
                 <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"><Icon.filter /></span>
-                <select
-                  value={dateFilter}
-                  onChange={e => setDateFilter(e.target.value)}
-                  className="appearance-none bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-8 py-2.5 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition cursor-pointer"
-                >
+                <select value={dateFilter} onChange={e => setDateFilter(e.target.value)}
+                  className="appearance-none bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-8 py-2.5 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition cursor-pointer">
                   <option value="all">Toutes les dates</option>
                   <option value="today">Aujourd'hui</option>
                   <option value="week">Cette semaine</option>
@@ -334,14 +362,11 @@ const Dashboard = () => {
                 <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none"><Icon.chevron /></span>
               </div>
 
-              {/* Filtre statut — NOUVEAU */}
+              {/* Filtre statut */}
               <div className="relative">
                 <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"><Icon.filter /></span>
-                <select
-                  value={statutFilter}
-                  onChange={e => setStatutFilter(e.target.value)}
-                  className="appearance-none bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-8 py-2.5 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition cursor-pointer"
-                >
+                <select value={statutFilter} onChange={e => setStatutFilter(e.target.value)}
+                  className="appearance-none bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-8 py-2.5 text-sm text-gray-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition cursor-pointer">
                   <option value="all">Tous les statuts</option>
                   <option value="connecte">Connectés</option>
                   <option value="en_attente">En attente</option>
@@ -383,6 +408,7 @@ const Dashboard = () => {
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Statut</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Date connexion</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Ticket</th>
+                      <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Source</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Adresse MAC</th>
                       <th className="text-left px-5 py-3.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">IP</th>
                     </tr>
@@ -398,7 +424,6 @@ const Dashboard = () => {
                           <td className="px-5 py-4">
                             <div className="flex items-center gap-3">
                               <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
-                                {/* Initiale visible seulement si connecté */}
                                 {estConnecte ? (r.nom?.[0] || "?").toUpperCase() : "?"}
                               </div>
                               <div>
@@ -424,21 +449,19 @@ const Dashboard = () => {
                             <BadgeStatut statut={r.statut} />
                           </td>
                           <td className="px-5 py-4 text-gray-600 text-xs leading-relaxed">
-                            {/* Priorité : date_connexion, sinon date_enregistrement */}
                             <div className="flex items-center gap-1.5">
                               <Icon.clock />
-                              <span>
-                                {toDate(r.date_connexion)
-                                  ? fmtDate(r.date_connexion)
-                                  : toDate(r.date_enregistrement)
-                                  ? fmtDate(r.date_enregistrement)
-                                  : "—"}
-                              </span>
+                              <span>{fmtDate(getDateRef(r))}</span>
                             </div>
                           </td>
                           <td className="px-5 py-4">
                             <span className="inline-flex items-center bg-slate-100 text-slate-700 text-xs font-mono font-semibold rounded-lg px-2.5 py-1">
                               {r.ticket_code || "—"}
+                            </span>
+                          </td>
+                          <td className="px-5 py-4">
+                            <span className="inline-flex items-center bg-blue-50 text-blue-600 text-xs font-semibold rounded-lg px-2.5 py-1">
+                              {r.source || "—"}
                             </span>
                           </td>
                           <td className="px-5 py-4">
@@ -492,12 +515,12 @@ const Dashboard = () => {
                         <div className="bg-slate-50 rounded-xl p-2.5">
                           <p className="text-gray-400 mb-0.5">Date connexion</p>
                           <p className="text-gray-700 font-medium leading-snug">
-                            {toDate(r.date_connexion)
-                              ? fmtDate(r.date_connexion)
-                              : toDate(r.date_enregistrement)
-                              ? fmtDate(r.date_enregistrement)
-                              : "—"}
+                            {fmtDate(getDateRef(r))}
                           </p>
+                        </div>
+                        <div className="bg-slate-50 rounded-xl p-2.5">
+                          <p className="text-gray-400 mb-0.5">Source</p>
+                          <p className="text-blue-600 font-semibold">{r.source || "—"}</p>
                         </div>
                         <div className="bg-slate-50 rounded-xl p-2.5">
                           <p className="text-gray-400 mb-0.5">Adresse IP</p>
@@ -520,13 +543,14 @@ const Dashboard = () => {
                     Page {page} sur {totalPages} · {filtered.length} entrées
                   </p>
                   <div className="flex items-center gap-1.5">
-                    <button
-                      onClick={() => setPage(p => Math.max(1, p - 1))}
-                      disabled={page === 1}
-                      className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-gray-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
-                    >← Préc</button>
+                    <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1}
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-gray-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                      ← Préc
+                    </button>
                     {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
-                      const p = totalPages <= 5 ? i + 1 : Math.max(1, Math.min(page - 2, totalPages - 4)) + i;
+                      const p = totalPages <= 5
+                        ? i + 1
+                        : Math.max(1, Math.min(page - 2, totalPages - 4)) + i;
                       return (
                         <button key={p} onClick={() => setPage(p)}
                           className={`w-8 h-8 rounded-lg text-xs font-medium transition ${
@@ -538,11 +562,10 @@ const Dashboard = () => {
                         </button>
                       );
                     })}
-                    <button
-                      onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                      disabled={page === totalPages}
-                      className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-gray-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
-                    >Suiv →</button>
+                    <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages}
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-gray-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                      Suiv →
+                    </button>
                   </div>
                 </div>
               )}
